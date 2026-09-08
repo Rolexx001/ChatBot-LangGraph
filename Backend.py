@@ -1,37 +1,147 @@
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
+from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.tools import tool, BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.tools import tool
+import aiosqlite
+import requests
+import asyncio
+import threading
+
 
 load_dotenv()
+
+#dedicated async loop for the backend tasks
+_ASYNC_LOOP=asyncio.new_event_loop()
+_ASYNC_THREAD=threading.Thread(target=_ASYNC_LOOP.run_forever,daemon=True)
+_ASYNC_THREAD.start()
+
+def _submit_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro,_ASYNC_LOOP)
+
+def run_async(coro):
+    return _submit_async(coro).result()
+
+def submit_async_task(coro):
+    """Schedule a coroutine on the backend event loop"""
+    return _submit_async(coro)
+
+
+# -------------------
+# 1. LLM
+# -------------------
 llm=ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite")
 
+# -------------------
+# 2. Tools
+# -------------------
+# Tools
+
+search_tool = DuckDuckGoSearchRun(region="us-en")
+
+
+@tool
+def get_stock_price(symbol: str) -> dict:
+    """
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
+    using Alpha Vantage with API key in the URL.
+    """
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
+    r = requests.get(url)
+    return r.json()
+
+client=MultiServerMCPClient(
+    {
+        "arith":{   #Local Server
+            "transport":"stdio",
+            "command":"uv",
+            "args": [
+                "run",
+                "fastmcp",
+                "run",
+                "main.py"
+            ],
+            "cwd": r"C:\Projects\MCP-Math_Server"
+        },
+        "test": {  #Remote Server
+            "transport": "streamable_http",
+            "url": "https://mcpplaygroundonline.com/mcp-complex-server"
+        }
+    }
+)
+
+def load_mcp_tools()->list[BaseTool]:
+    try:
+        return run_async(client.get_tools())
+    except Exception:
+        return []
+
+mcp_tools=load_mcp_tools()
+tools = [search_tool, get_stock_price, *mcp_tools]
+llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+
+# -------------------
+# 3. State
+# -------------------
 class ChatbotState(TypedDict):
     messages:Annotated[list[BaseMessage],add_messages]
 
+# -------------------
+# 4. Nodes
+# -------------------
+async def chat_node(state: ChatbotState):
+    """LLM node that may answer or request a tool call."""
+    messages = state["messages"]
+    response = llm_with_tools.ainvoke(messages)
+    return {"messages": [response]}
 
-def chat_node(state:ChatbotState):
-    messages = state['messages']
-    response = llm.invoke(messages)
-    return {'messages': [response]}
-conn=sqlite3.connect(database='chatbot.db',check_same_thread=False)
-checkpointer=SqliteSaver(conn=conn)
+tool_node = ToolNode(tools)
 
+# -------------------
+# 5. Checkpointer
+# -------------------
+async def init_checkpointer():
+    conn=await aiosqlite.connect(database='chatbot.db')
+    return AsyncSqliteSaver(conn)
+
+
+checkpointer=run_async(init_checkpointer())
+
+# -------------------
+# 6. Graph
+# -------------------
 graph=StateGraph(ChatbotState)
 
 graph.add_node('chat_node',chat_node)
 graph.add_edge(START,'chat_node')
-graph.add_edge('chat_node',END)
+
+if tool_node:
+    graph.add_node('tools',tool_node)
+    graph.add_conditional_edges('chat_node',tools_condition)
+    graph.add_edge('tools','chat_node')
+else:
+    graph.add_edge("chat_node",END)
 
 chatbot = graph.compile(checkpointer=checkpointer)
 
+# -------------------
+# 7. Helper
+# -------------------
+async def _alist_threads():
+    all_threads = set()
+    async for checkpoint in checkpointer.alist(None):
+        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(all_threads)
 
 def retrieve_all_threads():
-    all_threads=set()
-    for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config["configurable"]["thread_id"])
-    return list(all_threads)    
+    
+    return run_async(_alist_threads())   
